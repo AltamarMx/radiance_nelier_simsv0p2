@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Radiance generated files (reproducible via scripts)
+edificio/octrees/*
+!edificio/octrees/.gitkeep
+edificio/matrices/dc/*
+!edificio/matrices/dc/.gitkeep
+edificio/results/dc/*
+!edificio/results/dc/.gitkeep
+edificio/results/parametric/*
+!edificio/results/parametric/.gitkeep
+edificio/skyVectors/*.smx
+
+# Parametric grid search results (run_parametric_grid_extended.py)
+data/parametric/*
+!data/parametric/.gitkeep
+
+# Processed comparison CSVs (004_comparison_tables.py)
+data/radiance/*
+!data/radiance/.gitkeep
+
+# Quarto render output
+validation_report.html
+validation_report_files/
+.quarto/
+
+# OS
+.DS_Store

@@ -1,0 +1,49 @@
+# Radiance Materials - Edificio Main Room (CALIBRATED)
+# Optimal calibration from extended parametric grid search (3 parameters)
+#
+# Calibration adjustments:
+#   - Floor reflectance: 0.30 -> 0.21 (accounts for desk/furniture coverage)
+#   - Hallway reflectance: 0.36 -> 0.29 (accounts for hallway furniture/equipment)
+#   - Glazing transmittance: 0.88 -> 0.76 (accounts for frame obstruction + dirt)
+#
+# Optimal metrics: NMBE=-3.4%, CV(RMSE)=47.0%, R²=0.61, GOF=47.1%
+
+# FLOORS
+void plastic PISO-CONCRETO-PULIDOIER
+0
+0
+5 0.21 0.21 0.21 0.06 0.02
+
+void plastic PISO-PASILLOIER
+0
+0
+5 0.29 0.29 0.29 0 0
+
+# WALLS & STRUCTURE
+void plastic LadrilloIER
+0
+0
+5 0.55 0.55 0.55 0.04 0.03
+
+void plastic Material-de-bloque-de-componente-del-proyecto
+0
+0
+5 0.4 0.4 0.4 0 0
+
+# CEILING
+void plastic CONCRETO-ARMADOIER
+0
+0
+5 0.1 0.1 0.1 0 0
+
+# METAL ELEMENTS
+void metal AluminiumIER
+0
+0
+5 0.68 0.68 0.68 0.9 0.15
+
+# GLAZING (CALIBRATED)
+void glass Acristalamiento-exterior-del-proyecto
+0
+0
+3 0.76 0.76 0.76

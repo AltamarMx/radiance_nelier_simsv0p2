@@ -1,0 +1,1004 @@
+---
+title: "Radiance Daylighting Simulation - Validation Report"
+subtitle: "Experimental vs Numerical Comparison with Parametric Calibration"
+author: "Radiance Simulation Study"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    theme: cosmo
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Introduction
+
+This report validates a Radiance annual daylighting simulation (Two-Phase Method) against experimental illuminance measurements taken with luxmeters at 63 sensor points (7 lines x 9 sensors) for two representative days:
+
+- **June 26, 2024**: Summer conditions (high sun angle)
+- **November 20, 2024**: Fall/winter conditions (low sun angle)
+
+**Location**: Temixco, Mexico (18.85N, 99.14W)
+
+A parametric calibration (2704 combinations) explored three parameters:
+
+| Parameter | Symbol | Measured | Range explored | 
+|-----------|--------|----------|----------------|
+| Glazing transmittance | tau | 0.88 | 0.58 -- 0.88 |
+| Classroom floor reflectance | rho_floor | 0.30 | 0.05 -- 0.30 |
+| Hallway floor reflectance | rho_hall | 0.36 | 0.11 -- 0.36 |
+
+---
+
+## Setup
+
+```{python}
+#| label: setup
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import json
+from pathlib import Path
+from datetime import datetime
+
+plt.rcParams['figure.dpi'] = 40
+plt.rcParams['savefig.dpi'] = 40
+
+# Paths (relative to this file)
+DATA_DIR = Path("data")
+EDIFICIO_DIR = Path("edificio")
+PARAMETRIC_FILE = DATA_DIR / "parametric" / "grid_results_extended.csv"
+OPTIMAL_FILE = DATA_DIR / "parametric" / "optimal_parameters_extended.json"
+EXP_DIR = DATA_DIR / "experimental"
+RADIANCE_DIR = DATA_DIR / "radiance"
+ILL_FILE = EDIFICIO_DIR / "results" / "dc" / "annual_validation.ill"
+```
+
+---
+
+## 1. Load Experimental Data
+
+```{python}
+#| label: load-experimental
+
+def load_experimental_data(base_path, hours, reverse_odd_hours=True):
+    """Load experimental luxmeter data from CSV files.
+
+    Raw data is in kilolux, converted to lux.
+    Column I5N is excluded (faulty sensor).
+    Odd hours are reversed to match coordinate system.
+    """
+    cols_map = ['I1N', 'I2N', 'I3N', 'I4N', 'I1S', 'I2S', 'I3S', 'I4S', 'I5S']
+    dataframes = []
+    for hour in hours:
+        f = Path(base_path) / f"{hour:02d}h.csv"
+        df = pd.read_csv(f)
+        if reverse_odd_hours and hour % 2 == 1:
+            df = df[::-1].reset_index(drop=True)
+        dataframes.append(df[cols_map] * 1000)  # klux -> lux
+    return dataframes
+
+hours = [9, 10, 11, 12, 13, 14, 15, 16, 17]
+
+exp_jun = load_experimental_data(EXP_DIR / "005_26Junio", hours)
+exp_nov = load_experimental_data(EXP_DIR / "006_20Nov", hours)
+
+print(f"Loaded experimental data: {len(exp_jun)} hours (June), {len(exp_nov)} hours (November)")
+print(f"Grid: {exp_jun[0].shape[0]} lines x {exp_jun[0].shape[1]} sensors = {exp_jun[0].shape[0] * exp_jun[0].shape[1]} points")
+```
+
+---
+
+## 2. Load Radiance Simulation Data
+
+```{python}
+#| label: load-radiance
+
+def parse_annual_ill_file(filepath):
+    """Parse Radiance annual.ill file, skipping header lines."""
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+    skip_keywords = ['#', 'NCOMP', 'NROWS', 'NCOLS', 'FORMAT', 'SOFTWARE',
+                     'CAPDATE', 'GMT', 'rmtxop', 'dctimestep', 'Applied',
+                     'Transposed', 'LATLONG']
+    data_start = 0
+    for i, line in enumerate(lines):
+        if not any(line.startswith(kw) for kw in skip_keywords) and line.strip():
+            data_start = i
+            break
+    data = []
+    for line in lines[data_start:]:
+        if line.strip():
+            try:
+                data.append([float(x) for x in line.split()])
+            except ValueError:
+                continue
+    return np.array(data)
+
+def datetime_to_hour_of_year(month, day, hour, year=2024):
+    """Convert date/time to hour-of-year index (0-8759)."""
+    start = datetime(year, 1, 1)
+    target = datetime(year, month, day, hour)
+    return max(0, int((target - start).total_seconds() / 3600) - 1)
+
+def load_radiance_data(ill_file, month, day, hours):
+    """Extract radiance illuminance for specific date/hours, reshape to 7x9 grid."""
+    radiance_data = parse_annual_ill_file(ill_file)
+    NX, NY = 7, 9
+    cols_map = ['I1N', 'I2N', 'I3N', 'I4N', 'I1S', 'I2S', 'I3S', 'I4S', 'I5S']
+    dataframes = []
+    for hour in hours:
+        hour_idx = datetime_to_hour_of_year(month, day, hour)
+        illum_1d = radiance_data[hour_idx, :]
+        illum_2d = illum_1d.reshape(NX, NY)
+        illum_matched = illum_2d[::-1, ::-1]
+        df = pd.DataFrame(illum_matched, columns=cols_map)
+        dataframes.append(df)
+    return dataframes
+
+rad_jun = load_radiance_data(ILL_FILE, 6, 26, hours)
+rad_nov = load_radiance_data(ILL_FILE, 11, 20, hours)
+
+print(f"Loaded Radiance data: {len(rad_jun)} hours (June), {len(rad_nov)} hours (November)")
+```
+
+---
+
+## 3. Error Metrics
+
+The following metrics are used to evaluate the agreement between simulated ($E_{sim}$) and measured ($E_{meas}$) illuminance values, following ASHRAE Guideline 14-2014:
+
+**Normalized Mean Bias Error (NMBE)**:
+$$
+\text{NMBE} = \frac{\sum_{i=1}^{n}(E_{meas,i} - E_{sim,i})}{n \cdot \bar{E}_{meas}} \times 100\%
+$$
+Indicates systematic over- or under-prediction. Positive NMBE means the simulation underestimates measurements. ASHRAE threshold: $|\text{NMBE}| \leq 10\%$.
+
+**Coefficient of Variation of the Root Mean Square Error (CV(RMSE))**:
+$$
+\text{CV(RMSE)} = \frac{\sqrt{\frac{1}{n}\sum_{i=1}^{n}(E_{meas,i} - E_{sim,i})^2}}{\bar{E}_{meas}} \times 100\%
+$$
+Measures overall scatter between simulation and measurements, normalized by the experimental mean. ASHRAE threshold: $\text{CV(RMSE)} \leq 30\%$.
+
+**Coefficient of Determination ($R^2$)**:
+$$
+R^2 = 1 - \frac{\sum_{i=1}^{n}(E_{meas,i} - E_{sim,i})^2}{\sum_{i=1}^{n}(E_{meas,i} - \bar{E}_{meas})^2}
+$$
+Proportion of variance in the measurements explained by the simulation. Values closer to 1 indicate better agreement. ASHRAE threshold: $R^2 > 0.85$.
+
+**Goodness of Fit (GOF)**:
+$$
+\text{GOF} = \sqrt{\text{NMBE}^2 + \text{CV(RMSE)}^2}
+$$
+Combined metric used as the optimization target in the parametric search. Lower is better.
+
+Where $n$ is the total number of measurement points and $\bar{E}_{meas}$ is the mean of measured values.
+
+```{python}
+#| label: metrics-functions
+
+def compute_metrics(exp_list, rad_list):
+    """Compute ASHRAE Guideline 14 error metrics.
+
+    Returns: NMBE, CV(RMSE), R2, GOF
+    NMBE positive = simulation underestimates
+    """
+    all_exp = np.concatenate([df.values.flatten() for df in exp_list])
+    all_rad = np.concatenate([df.values.flatten() for df in rad_list])
+
+    n = len(all_exp)
+    mean_exp = all_exp.mean()
+    errors = all_exp - all_rad  # measured - simulated
+
+    nmbe = (np.sum(errors) / (n * mean_exp)) * 100
+    rmse = np.sqrt(np.mean(errors**2))
+    cvrmse = (rmse / mean_exp) * 100
+    ss_res = np.sum(errors**2)
+    ss_tot = np.sum((all_exp - mean_exp)**2)
+    r2 = 1 - (ss_res / ss_tot)
+    gof = np.sqrt(nmbe**2 + cvrmse**2)
+
+    return {
+        'nmbe': nmbe, 'cvrmse': cvrmse, 'r2': r2, 'gof': gof,
+        'rmse': rmse, 'mean_exp': mean_exp, 'mean_sim': all_rad.mean(),
+        'meets_ashrae': abs(nmbe) <= 10 and cvrmse <= 30
+    }
+
+# Original simulation metrics
+m_jun = compute_metrics(exp_jun, rad_jun)
+m_nov = compute_metrics(exp_nov, rad_nov)
+
+print("=== ORIGINAL SIMULATION (measured material properties) ===")
+print(f"  tau=0.88, rho_floor=0.30, rho_hall=0.36")
+print()
+print(f"  June 26:     NMBE={m_jun['nmbe']:+.2f}%  CV(RMSE)={m_jun['cvrmse']:.2f}%  R2={m_jun['r2']:.3f}  GOF={m_jun['gof']:.2f}%")
+print(f"  November 20: NMBE={m_nov['nmbe']:+.2f}%  CV(RMSE)={m_nov['cvrmse']:.2f}%  R2={m_nov['r2']:.3f}  GOF={m_nov['gof']:.2f}%")
+print()
+print(f"  ASHRAE Jun: {'PASS' if m_jun['meets_ashrae'] else 'FAIL'}  |  Nov: {'PASS' if m_nov['meets_ashrae'] else 'FAIL'}")
+```
+
+---
+
+## 4. Parametric Calibration Results
+
+```{python}
+#| label: parametric-load
+
+results_df = pd.read_csv(PARAMETRIC_FILE)
+results_df = results_df[results_df['success'] == True].copy()
+
+# Compute per-day GOF
+results_df['gof_jun'] = np.sqrt(results_df['nmbe_jun']**2 + results_df['cvrmse_jun']**2)
+results_df['gof_nov'] = np.sqrt(results_df['nmbe_nov']**2 + results_df['cvrmse_nov']**2)
+
+print(f"Parametric search: {len(results_df)} successful combinations")
+print(f"  tau: {results_df['tau'].min():.2f} - {results_df['tau'].max():.2f} (step 0.02)")
+print(f"  rho_floor: {results_df['rho_floor'].min():.2f} - {results_df['rho_floor'].max():.2f} (step 0.02)")
+print(f"  rho_hall: {results_df['rho_hall'].min():.2f} - {results_df['rho_hall'].max():.2f} (step 0.02)")
+```
+
+### 4.1 Best Parameters per Day
+
+```{python}
+#| label: best-per-day
+#| output: asis
+
+best_jun = results_df.loc[results_df['gof_jun'].idxmin()]
+best_nov = results_df.loc[results_df['gof_nov'].idxmin()]
+best_comb = results_df.loc[results_df['gof'].idxmin()]
+
+summary_data = []
+for label, row in [('June 26', best_jun), ('November 20', best_nov), ('Combined', best_comb)]:
+    gof_j = np.sqrt(row['nmbe_jun']**2 + row['cvrmse_jun']**2)
+    gof_n = np.sqrt(row['nmbe_nov']**2 + row['cvrmse_nov']**2)
+    summary_data.append({
+        'Optimized for': label,
+        'tau': f"{row['tau']:.2f}",
+        'rho_floor': f"{row['rho_floor']:.2f}",
+        'rho_hall': f"{row['rho_hall']:.2f}",
+        'NMBE_jun [%]': f"{row['nmbe_jun']:+.2f}",
+        'CV_jun [%]': f"{row['cvrmse_jun']:.2f}",
+        'R2_jun': f"{row['r2_jun']:.3f}",
+        'NMBE_nov [%]': f"{row['nmbe_nov']:+.2f}",
+        'CV_nov [%]': f"{row['cvrmse_nov']:.2f}",
+        'R2_nov': f"{row['r2_nov']:.3f}",
+    })
+
+print(pd.DataFrame(summary_data).to_markdown(index=False))
+```
+
+### 4.2 Parameter Ranges
+
+```{python}
+#| label: parameter-ranges
+
+print("Parameter ranges from per-day optima:")
+print()
+for param, label in [('tau', 'Glazing transmittance'),
+                      ('rho_floor', 'Floor reflectance'),
+                      ('rho_hall', 'Hallway reflectance')]:
+    v_jun = best_jun[param]
+    v_nov = best_nov[param]
+    v_comb = best_comb[param]
+    print(f"  {label} ({param}):")
+    print(f"    Best June:     {v_jun:.2f}")
+    print(f"    Best November: {v_nov:.2f}")
+    print(f"    Best Combined: {v_comb:.2f}")
+    print(f"    Range:         [{min(v_jun, v_nov):.2f}, {max(v_jun, v_nov):.2f}]")
+    print()
+```
+
+---
+
+## 5. GOF Heatmaps and Sensitivity Analysis
+
+### 5.1 Per-Day GOF vs (tau, rho_floor)
+
+```{python}
+#| label: fig-gof-heatmaps
+#| fig-cap: "GOF for June 26 and November 20 independently"
+#| fig-width: 14
+#| fig-height: 5
+
+TAU_VALUES = np.sort(results_df['tau'].unique())
+RHO_FLOOR_VALUES = np.sort(results_df['rho_floor'].unique())
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for ax, day_label, gof_col, best, rho_hall_val in [
+    (axes[0], 'June 26', 'gof_jun', best_jun, best_jun['rho_hall']),
+    (axes[1], 'November 20', 'gof_nov', best_nov, best_nov['rho_hall'])
+]:
+    slice_data = results_df[np.isclose(results_df['rho_hall'], rho_hall_val, atol=0.001)]
+    if len(slice_data) > 0:
+        pivot = slice_data.pivot(index='rho_floor', columns='tau', values=gof_col)
+        im = ax.imshow(pivot.values, cmap='RdYlGn_r', aspect='auto',
+                       extent=[TAU_VALUES[0]-0.01, TAU_VALUES[-1]+0.01,
+                               RHO_FLOOR_VALUES[0]-0.01, RHO_FLOOR_VALUES[-1]+0.01],
+                       origin='lower')
+        plt.colorbar(im, ax=ax, label='GOF [%]')
+        ax.plot(best['tau'], best['rho_floor'], 'r*', markersize=15,
+                markeredgecolor='white', markeredgewidth=1.5)
+        ax.set_xlabel(r'$\tau$ (Glazing Transmittance)')
+        ax.set_ylabel(r'$\rho_{floor}$ (Floor Reflectance)')
+        ax.set_title(f'{day_label} (at $\\rho_{{hall}}$ = {rho_hall_val:.2f})')
+
+plt.tight_layout()
+plt.show()
+```
+
+### 5.2 Combined GOF
+
+```{python}
+#| label: fig-gof-combined
+#| fig-cap: "Combined GOF at optimal rho_hall"
+#| fig-width: 8
+#| fig-height: 5
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+opt_rho_hall = best_comb['rho_hall']
+slice_data = results_df[np.isclose(results_df['rho_hall'], opt_rho_hall, atol=0.001)]
+if len(slice_data) > 0:
+    pivot = slice_data.pivot(index='rho_floor', columns='tau', values='gof')
+    im = ax.imshow(pivot.values, cmap='RdYlGn_r', aspect='auto',
+                   extent=[TAU_VALUES[0]-0.01, TAU_VALUES[-1]+0.01,
+                           RHO_FLOOR_VALUES[0]-0.01, RHO_FLOOR_VALUES[-1]+0.01],
+                   origin='lower')
+    plt.colorbar(im, ax=ax, label='GOF [%]')
+    ax.plot(best_comb['tau'], best_comb['rho_floor'], 'r*', markersize=15,
+            markeredgecolor='white', markeredgewidth=1.5, label='Optimal')
+    ax.set_xlabel(r'$\tau$ (Glazing Transmittance)')
+    ax.set_ylabel(r'$\rho_{floor}$ (Floor Reflectance)')
+    ax.set_title(f'Combined GOF at $\\rho_{{hall}}$ = {opt_rho_hall:.2f}')
+    ax.legend()
+
+plt.tight_layout()
+plt.show()
+```
+
+### 5.3 GOF Comparison: Per-Day vs Combined
+
+Each day achieves a lower (better) GOF when optimized independently than when using the single best combined parameter set. Since $\text{GOF} = \sqrt{\text{NMBE}^2 + \text{CV(RMSE)}^2}$, we show the individual components to identify which metric drives the difference.
+
+```{python}
+#| label: gof-comparison-table
+#| output: asis
+
+rows = [
+    {
+        'Optimized for': 'June 26',
+        'tau': f"{best_jun['tau']:.2f}",
+        'rho_floor': f"{best_jun['rho_floor']:.2f}",
+        'rho_hall': f"{best_jun['rho_hall']:.2f}",
+        'NMBE [%]': f"{best_jun['nmbe_jun']:+.1f}",
+        'CV(RMSE) [%]': f"{best_jun['cvrmse_jun']:.1f}",
+        'R2': f"{best_jun['r2_jun']:.3f}",
+        'GOF [%]': f"{np.sqrt(best_jun['nmbe_jun']**2 + best_jun['cvrmse_jun']**2):.1f}",
+    },
+    {
+        'Optimized for': 'November 20',
+        'tau': f"{best_nov['tau']:.2f}",
+        'rho_floor': f"{best_nov['rho_floor']:.2f}",
+        'rho_hall': f"{best_nov['rho_hall']:.2f}",
+        'NMBE [%]': f"{best_nov['nmbe_nov']:+.1f}",
+        'CV(RMSE) [%]': f"{best_nov['cvrmse_nov']:.1f}",
+        'R2': f"{best_nov['r2_nov']:.3f}",
+        'GOF [%]': f"{np.sqrt(best_nov['nmbe_nov']**2 + best_nov['cvrmse_nov']**2):.1f}",
+    },
+    {
+        'Optimized for': 'Combined (Jun)',
+        'tau': f"{best_comb['tau']:.2f}",
+        'rho_floor': f"{best_comb['rho_floor']:.2f}",
+        'rho_hall': f"{best_comb['rho_hall']:.2f}",
+        'NMBE [%]': f"{best_comb['nmbe_jun']:+.1f}",
+        'CV(RMSE) [%]': f"{best_comb['cvrmse_jun']:.1f}",
+        'R2': f"{best_comb['r2_jun']:.3f}",
+        'GOF [%]': f"{np.sqrt(best_comb['nmbe_jun']**2 + best_comb['cvrmse_jun']**2):.1f}",
+    },
+    {
+        'Optimized for': 'Combined (Nov)',
+        'tau': f"{best_comb['tau']:.2f}",
+        'rho_floor': f"{best_comb['rho_floor']:.2f}",
+        'rho_hall': f"{best_comb['rho_hall']:.2f}",
+        'NMBE [%]': f"{best_comb['nmbe_nov']:+.1f}",
+        'CV(RMSE) [%]': f"{best_comb['cvrmse_nov']:.1f}",
+        'R2': f"{best_comb['r2_nov']:.3f}",
+        'GOF [%]': f"{np.sqrt(best_comb['nmbe_nov']**2 + best_comb['cvrmse_nov']**2):.1f}",
+    },
+]
+
+print(pd.DataFrame(rows).to_markdown(index=False))
+```
+
+### 5.4 Sensitivity Analysis
+
+```{python}
+#| label: fig-sensitivity
+#| fig-cap: "Sensitivity of GOF to each parameter at the combined optimum"
+#| fig-width: 14
+#| fig-height: 4
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
+
+param_configs = [
+    ('tau', 'rho_floor', 'rho_hall', r'$\tau$ (Glazing Transmittance)', 'steelblue'),
+    ('rho_floor', 'tau', 'rho_hall', r'$\rho_{floor}$ (Floor Reflectance)', 'seagreen'),
+    ('rho_hall', 'tau', 'rho_floor', r'$\rho_{hall}$ (Hallway Reflectance)', 'darkorchid'),
+]
+
+for ax, (vary_param, fix1, fix2, xlabel, color) in zip(axes, param_configs):
+    mask = (
+        np.isclose(results_df[fix1], best_comb[fix1], atol=0.001) &
+        np.isclose(results_df[fix2], best_comb[fix2], atol=0.001)
+    )
+    sens_data = results_df[mask].sort_values(vary_param)
+
+    if len(sens_data) > 0:
+        ax.plot(sens_data[vary_param], sens_data['gof_jun'], 'o-', color='orange',
+                linewidth=2, markersize=5, label='GOF June')
+        ax.plot(sens_data[vary_param], sens_data['gof_nov'], 's-', color='royalblue',
+                linewidth=2, markersize=5, label='GOF November')
+        ax.plot(sens_data[vary_param], sens_data['gof'], 'D-', color='black',
+                linewidth=2, markersize=5, label='GOF Combined')
+        ax.axvline(best_comb[vary_param], color='red', linestyle='--', alpha=0.7)
+
+    ax.set_xlabel(xlabel)
+    if ax == axes[0]:
+        ax.set_ylabel('GOF [%]')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+plt.suptitle('Sensitivity Analysis (at combined optimum)', fontweight='bold')
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 6. Illuminance Contour Maps
+
+```{python}
+#| label: contour-setup
+
+# Physical sensor grid positions [m]
+distancia_muro_norte = 0.51
+distancia_entre_sensores = 1.08
+distancia_muro_sur = 0.51
+distancia_pizarron = 0.71
+distancia_entre_lineas = 1.08
+distancia_muro_fondo = 0.68
+
+x_positions = [distancia_muro_norte + i * distancia_entre_sensores for i in range(9)]
+y_positions = [distancia_pizarron + i * distancia_entre_lineas for i in range(7)]
+
+niveles = [0, 300, 500, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 10000]
+plot_hours = [9, 10, 11, 12, 13, 14, 15, 16, 17]
+hour_labels = ["9:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00"]
+
+X, Y = np.meshgrid(x_positions, y_positions)
+
+def plot_contour_comparison(exp_list, rad_list, title):
+    """Plot experimental (top) vs best numerical fit (bottom) for each hour."""
+    fig, axes = plt.subplots(6, 3, figsize=(18, 24), sharex=True, sharey=True)
+
+    for i, hora in enumerate(hour_labels):
+        row_exp = (i // 3) * 2      # rows 0, 2, 4
+        row_rad = (i // 3) * 2 + 1  # rows 1, 3, 5
+        col = i % 3
+
+        Z_exp = exp_list[i].values.astype(float)
+        Z_rad = rad_list[i].values.astype(float)
+
+        # Experimental (top of each pair)
+        ax_exp = axes[row_exp, col]
+        cf = ax_exp.contourf(X, Y, Z_exp, cmap='jet', alpha=0.7, levels=niveles)
+        c = ax_exp.contour(X, Y, Z_exp, colors='black', levels=niveles)
+        ax_exp.clabel(c, inline=True, fontsize=8)
+        ax_exp.set_aspect('auto')
+        ax_exp.set_title(f'{hora}', fontsize=11, fontweight='bold')
+        ax_exp.set_xticks(x_positions)
+        ax_exp.set_yticks(y_positions)
+        if col == 0:
+            ax_exp.set_ylabel('Experimental\n[m]', fontsize=10)
+
+        # Radiance (bottom of each pair)
+        ax_rad = axes[row_rad, col]
+        cf = ax_rad.contourf(X, Y, Z_rad, cmap='jet', alpha=0.7, levels=niveles)
+        c = ax_rad.contour(X, Y, Z_rad, colors='black', levels=niveles)
+        ax_rad.clabel(c, inline=True, fontsize=8)
+        ax_rad.set_aspect('auto')
+        ax_rad.set_xticks(x_positions)
+        ax_rad.set_yticks(y_positions)
+        if col == 0:
+            ax_rad.set_ylabel('Radiance\n[m]', fontsize=10)
+
+    # Invert Y axis once (shared axes, so one call affects all)
+    axes[0, 0].invert_yaxis()
+
+    # X labels on bottom row only
+    for col in range(3):
+        axes[5, col].set_xlabel('[m]')
+
+    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+    fig.colorbar(cf, cax=cbar_ax, label='Illuminance [lux]')
+
+    fig.suptitle(f'{title}', fontsize=14, fontweight='bold', y=1.0)
+    plt.tight_layout(rect=[0, 0, 0.91, 0.99])
+    plt.show()
+```
+
+### 6.1 June 26 - Experimental vs Radiance
+
+```{python}
+#| label: fig-contour-jun
+#| fig-cap: "June 26 - Experimental (top) vs Radiance (bottom) for each hour"
+#| fig-width: 18
+#| fig-height: 24
+
+plot_contour_comparison(exp_jun, rad_jun, 'June 26, 2024 - Experimental vs Radiance')
+```
+
+### 6.2 November 20 - Experimental vs Radiance
+
+```{python}
+#| label: fig-contour-nov
+#| fig-cap: "November 20 - Experimental (top) vs Radiance (bottom) for each hour"
+#| fig-width: 18
+#| fig-height: 24
+
+plot_contour_comparison(exp_nov, rad_nov, 'November 20, 2024 - Experimental vs Radiance')
+```
+
+### 6.3 June 26 - Experimental and Radiance (3x3 grids)
+
+```{python}
+#| label: fig-contour-jun-stacked
+#| fig-cap: "June 26 - Experimental (top) and Radiance (bottom), shared colorbar"
+
+def plot_contour_3x3(data_list, title, label):
+    """Plot a single 3x3 grid of hourly illuminance contour maps."""
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12), sharex=True, sharey=True)
+
+    for i, hora in enumerate(hour_labels):
+        ax = axes[i // 3, i % 3]
+        Z = data_list[i].values.astype(float)
+
+        cf = ax.contourf(X, Y, Z, cmap='jet', alpha=0.7, levels=niveles)
+        c = ax.contour(X, Y, Z, colors='black', levels=niveles)
+        ax.clabel(c, inline=True, fontsize=8)
+        ax.set_aspect('auto')
+        ax.set_title(f'{hora}')
+        ax.set_xticks(x_positions)
+        ax.set_yticks(y_positions)
+
+    # Invert Y axis once (shared axes, so one call affects all)
+    axes[0, 0].invert_yaxis()
+
+    for i in range(3):
+        axes[2, i].set_xlabel('[m]')
+        axes[i, 0].set_ylabel('[m]')
+
+    fig.suptitle(f'{title} - {label}', fontsize=14, fontweight='bold')
+    return fig, cf
+
+fig_exp, cf_exp = plot_contour_3x3(exp_jun, 'June 26, 2024', 'Experimental')
+fig_rad, cf_rad = plot_contour_3x3(rad_jun, 'June 26, 2024', 'Radiance')
+
+# Shared colorbar as a separate figure
+fig_cb, ax_cb = plt.subplots(figsize=(8, 0.4))
+fig_cb.colorbar(cf_exp, cax=ax_cb, orientation='horizontal', label='Illuminance [lux]')
+plt.show()
+```
+
+### 6.4 November 20 - Experimental and Radiance (3x3 grids)
+
+```{python}
+#| label: fig-contour-nov-stacked
+#| fig-cap: "November 20 - Experimental (top) and Radiance (bottom), shared colorbar"
+
+fig_exp, cf_exp = plot_contour_3x3(exp_nov, 'November 20, 2024', 'Experimental')
+fig_rad, cf_rad = plot_contour_3x3(rad_nov, 'November 20, 2024', 'Radiance')
+
+fig_cb, ax_cb = plt.subplots(figsize=(8, 0.4))
+fig_cb.colorbar(cf_exp, cax=ax_cb, orientation='horizontal', label='Illuminance [lux]')
+plt.show()
+```
+
+---
+
+## 7. Scatter Plots
+
+```{python}
+#| label: fig-scatter
+#| fig-cap: "Scatter plot: experimental vs simulated illuminance"
+#| fig-width: 12
+#| fig-height: 5
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+
+# Compute shared axis range from June 26 data
+all_exp_jun = np.concatenate([df.values.flatten() for df in exp_jun])
+all_rad_jun = np.concatenate([df.values.flatten() for df in rad_jun])
+max_val = max(all_exp_jun.max(), all_rad_jun.max()) * 1.05
+
+for ax, exp_list, rad_list, label, metrics in [
+    (axes[0], exp_jun, rad_jun, 'June 26', m_jun),
+    (axes[1], exp_nov, rad_nov, 'November 20', m_nov)
+]:
+    all_exp = np.concatenate([df.values.flatten() for df in exp_list])
+    all_rad = np.concatenate([df.values.flatten() for df in rad_list])
+
+    ax.scatter(all_exp, all_rad, s=5, alpha=0.3, c='steelblue')
+    ax.plot([0, max_val], [0, max_val], 'k--', linewidth=1, label='1:1 line')
+    ax.set_xlabel('Experimental [lux]')
+    if ax == axes[0]:
+        ax.set_ylabel('Simulated [lux]')
+    ax.set_title(f"{label}\nNMBE={metrics['nmbe']:+.1f}%, CV={metrics['cvrmse']:.1f}%, R2={metrics['r2']:.3f}")
+    ax.set_xlim(0, max_val)
+    ax.set_ylim(0, max_val)
+    ax.set_aspect('equal')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 8. Hourly Mean Comparison
+
+```{python}
+#| label: fig-hourly-mean
+#| fig-cap: "Hourly spatial-mean illuminance: experimental vs simulated"
+#| fig-width: 12
+#| fig-height: 5
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+
+for ax, exp_list, rad_list, label in [
+    (axes[0], exp_jun, rad_jun, 'June 26'),
+    (axes[1], exp_nov, rad_nov, 'November 20')
+]:
+    exp_means = [df.values.mean() for df in exp_list]
+    rad_means = [df.values.mean() for df in rad_list]
+
+    ax.plot(hours, exp_means, 'ko-', linewidth=2, markersize=6, label='Experimental')
+    ax.plot(hours, rad_means, 's--', color='steelblue', linewidth=2, markersize=6, label='Radiance (original)')
+    ax.set_xlabel('Hour')
+    ax.set_ylabel('Mean Illuminance [lux]')
+    ax.set_title(label)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(hours)
+
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 9. Useful Daylight Illuminance (UDI)
+
+UDI classifies each sensor point at each occupied hour into three bins based on illuminance thresholds:
+
+- **UDI_under**: E < 300 lux (insufficient daylight)
+- **UDI_useful**: 300 ≤ E ≤ 2000 lux (useful daylight range)
+- **UDI_over**: E > 2000 lux (excessive, potential glare risk)
+
+The result is expressed as the percentage of occupied hours (8:00–18:00, all days) falling in each bin, per sensor point.
+
+Two simulations are compared using the 480-point grid (20×24) with per-day optimal parameters from the parametric search:
+
+| Simulation | $\tau$ | $\rho_{floor}$ | $\rho_{hall}$ |
+|-----------|--------|-----------------|---------------|
+| June optimum | 0.80 | 0.17 | 0.13 |
+| November optimum | 0.70 | 0.11 | 0.17 |
+
+```{python}
+#| label: udi-setup
+
+ILL_JUN_OPT = EDIFICIO_DIR / "results" / "dc" / "annual_jun_optimal.ill"
+ILL_NOV_OPT = EDIFICIO_DIR / "results" / "dc" / "annual_nov_optimal.ill"
+
+def get_occupied_mask(n_hours, hours_range=(8, 18)):
+    """Mask for occupied hours (8:00-18:00)."""
+    mask = np.zeros(n_hours, dtype=bool)
+    for h in range(n_hours):
+        if hours_range[0] <= h % 24 < hours_range[1]:
+            mask[h] = True
+    return mask
+
+def compute_udi(ill_file, nx=20, ny=24):
+    """Compute UDI bins from annual illuminance file on the 480-point grid."""
+    data = parse_annual_ill_file(ill_file)
+    occ = get_occupied_mask(data.shape[0], (8, 18))
+    occ_data = data[occ, :]
+
+    udi_under = (occ_data < 300).mean(axis=0) * 100
+    udi_useful = ((occ_data >= 300) & (occ_data <= 2000)).mean(axis=0) * 100
+    udi_over = (occ_data > 2000).mean(axis=0) * 100
+
+    return {
+        'under': udi_under.reshape(nx, ny).T,
+        'useful': udi_useful.reshape(nx, ny).T,
+        'over': udi_over.reshape(nx, ny).T,
+        'n_occupied': int(occ.sum()),
+    }
+
+# Load 480-point sensor positions
+sensors_480 = np.loadtxt(EDIFICIO_DIR / "points.txt")
+xs_480 = np.unique(np.round(sensors_480[:, 0], 3))
+ys_480 = np.unique(np.round(sensors_480[:, 1], 3))
+# Rotate 90 CCW: Y on horizontal axis, X on vertical axis
+Y_480_h, X_480_v = np.meshgrid(-ys_480, xs_480)
+
+udi_jun = compute_udi(ILL_JUN_OPT)
+udi_nov = compute_udi(ILL_NOV_OPT)
+
+print(f"Occupied hours: {udi_jun['n_occupied']} (8:00-18:00, all days)")
+print(f"Grid: {len(xs_480)} x {len(ys_480)} = {len(xs_480) * len(ys_480)} points")
+```
+
+### UDI Contour Maps
+
+```{python}
+#| label: fig-udi-maps
+#| fig-cap: "UDI maps: June optimum (top) vs November optimum (bottom)"
+#| fig-width: 18
+#| fig-height: 10
+
+udi_levels = np.arange(0, 101, 10)
+
+fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True, sharey=True)
+
+bins_config = [
+    ('under', 'UDI_under (<300 lux)', 'Blues'),
+    ('useful', 'UDI_useful (300-2000 lux)', 'Greens'),
+    ('over', 'UDI_over (>2000 lux)', 'Reds'),
+]
+
+for row_idx, (label, udi) in enumerate([('June optimum', udi_jun), ('November optimum', udi_nov)]):
+    for col_idx, (key, title, cmap) in enumerate(bins_config):
+        ax = axes[row_idx, col_idx]
+        Z = udi[key]
+
+        cf = ax.contourf(Y_480_h, X_480_v, Z.T, levels=udi_levels, cmap=cmap)
+        c = ax.contour(Y_480_h, X_480_v, Z.T, levels=udi_levels, colors='black', linewidths=0.5)
+        ax.clabel(c, inline=True, fontsize=8, fmt='%.0f%%')
+        ax.set_aspect('auto')
+
+        if row_idx == 0:
+            ax.set_title(f'{title}', fontweight='bold')
+        if col_idx == 0:
+            ax.set_ylabel(f'{label}\n[m]', fontsize=10)
+
+for i in range(3):
+    axes[1, i].set_xlabel('[m]')
+
+cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+fig.colorbar(cf, cax=cbar_ax, label='% of occupied hours')
+
+fig.suptitle('Useful Daylight Illuminance (480-point grid)\nUDI_under < 300 lux | 300 ≤ UDI_useful ≤ 2000 lux | UDI_over > 2000 lux\nOccupied hours: 8:00–18:00, 366 days (3660 h)', fontsize=12, fontweight='bold')
+plt.tight_layout(rect=[0, 0, 0.91, 0.97])
+plt.show()
+```
+
+
+---
+
+## 10. Temporal Comfort Map
+
+This section shows the percentage of floor area within the useful daylight range (300–2000 lux) for each hour-month combination, following the approach of Piderit and Yáñez (2015). While the spatial UDI maps answer *where* daylight is adequate, this temporal heatmap answers *when*.
+
+Each cell represents the average percentage of the 480 sensor points that fall within 300–2000 lux for a given hour of the day and month of the year.
+
+```{python}
+#| label: fig-temporal-comfort
+#| fig-cap: "Temporal comfort map: % of floor area in useful daylight range (300-2000 lux)"
+#| fig-width: 14
+#| fig-height: 10
+
+from datetime import datetime as dt
+
+def compute_temporal_comfort(ill_file, n_points=480, lux_min=300, lux_max=2000):
+    """Compute hour-month matrix of % area in comfort range."""
+    data = parse_annual_ill_file(ill_file)
+    n_hours = data.shape[0]
+
+    # Determine if leap year
+    year = 2024 if n_hours >= 8784 else 2023
+
+    # Build month and hour arrays
+    months = np.zeros(n_hours, dtype=int)
+    hours_of_day = np.zeros(n_hours, dtype=int)
+    for h in range(n_hours):
+        # Hour of day
+        hours_of_day[h] = h % 24
+        # Month: accumulate days per month
+        day_of_year = h // 24
+        d = dt(year, 1, 1) + pd.Timedelta(days=day_of_year)
+        months[h] = d.month
+
+    # Percentage of points in comfort for each hour
+    in_comfort = ((data >= lux_min) & (data <= lux_max)).mean(axis=1) * 100
+
+    # Build 24 x 12 matrix (hours x months)
+    matrix = np.full((24, 12), np.nan)
+    for month in range(1, 13):
+        for hour in range(24):
+            mask = (months == month) & (hours_of_day == hour)
+            if mask.sum() > 0:
+                matrix[hour, month - 1] = in_comfort[mask].mean()
+
+    # Replace 0% with NaN so it shows as blank (no daylight)
+    matrix[matrix == 0] = np.nan
+
+    return matrix
+
+month_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+matrix_jun = compute_temporal_comfort(ILL_JUN_OPT)
+matrix_nov = compute_temporal_comfort(ILL_NOV_OPT)
+
+fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True, sharey=True)
+
+for ax, matrix, label, params in [
+    (axes[0], matrix_jun, 'June optimum',
+     r'$\tau$=0.80, $\rho_f$=0.17, $\rho_h$=0.13'),
+    (axes[1], matrix_nov, 'November optimum',
+     r'$\tau$=0.70, $\rho_f$=0.11, $\rho_h$=0.17'),
+]:
+    im = ax.imshow(matrix, aspect='auto', cmap='RdYlGn',
+                   vmin=0, vmax=100, origin='lower',
+                   extent=[-0.5, 11.5, -0.5, 23.5])
+
+    ax.set_yticks(range(0, 24, 2))
+    ax.set_xticks(range(12))
+    ax.set_xticklabels(month_labels)
+    ax.set_ylabel('Hour of day')
+    ax.set_title(f'{label} ({params})', fontsize=11)
+
+
+axes[1].set_xlabel('Month')
+
+cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+fig.colorbar(im, cax=cbar_ax, label='% of floor area in 300-2000 lux')
+
+fig.suptitle('Temporal Comfort Map\n% of floor area within useful daylight range (300–2000 lux)',
+             fontsize=13, fontweight='bold')
+plt.tight_layout(rect=[0, 0, 0.91, 0.95])
+plt.show()
+```
+
+### Difference: June optimum - November optimum
+
+```{python}
+#| label: fig-temporal-comfort-diff
+#| fig-cap: "Temporal comfort map difference (June opt - November opt)"
+#| fig-width: 14
+#| fig-height: 5
+
+fig, ax = plt.subplots(figsize=(14, 5))
+
+diff = matrix_jun - matrix_nov
+
+from matplotlib.colors import TwoSlopeNorm
+diff_norm = TwoSlopeNorm(vmin=-10, vcenter=0, vmax=20)
+im = ax.imshow(diff, aspect='auto', cmap='RdBu', norm=diff_norm,
+               origin='lower', extent=[-0.5, 11.5, -0.5, 23.5])
+
+ax.set_yticks(range(0, 24, 2))
+ax.set_xticks(range(12))
+ax.set_xticklabels(month_labels)
+ax.set_ylabel('Hour of day')
+ax.set_xlabel('Month')
+ax.set_title('Difference (June optimum - November optimum)\nPositive = June has more area in comfort', fontsize=11)
+
+ax.axhline(8, color='gray', linestyle=':', linewidth=0.8, alpha=0.5)
+ax.axhline(18, color='gray', linestyle=':', linewidth=0.8, alpha=0.5)
+
+# Annotate max and min values
+diff_valid = np.where(np.isnan(diff), 0, diff)
+max_idx = np.unravel_index(np.argmax(diff_valid), diff_valid.shape)
+min_idx = np.unravel_index(np.argmin(diff_valid), diff_valid.shape)
+
+ax.text(max_idx[1], max_idx[0], f'{diff_valid[max_idx]:+.1f}%',
+        ha='center', va='center', fontsize=9, fontweight='bold', color='black',
+        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+ax.text(min_idx[1], min_idx[0], f'{diff_valid[min_idx]:+.1f}%',
+        ha='center', va='center', fontsize=9, fontweight='bold', color='black',
+        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+
+plt.colorbar(im, ax=ax, label='Difference [% points]')
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 11. Summary
+
+```{python}
+#| label: summary
+#| output: asis
+
+# Summary table
+rows = []
+
+# Original
+rows.append({
+    'Configuration': 'Original (measured)',
+    'tau': '0.88', 'rho_floor': '0.30', 'rho_hall': '0.36',
+    'NMBE_jun': f"{m_jun['nmbe']:+.1f}", 'CV_jun': f"{m_jun['cvrmse']:.1f}",
+    'NMBE_nov': f"{m_nov['nmbe']:+.1f}", 'CV_nov': f"{m_nov['cvrmse']:.1f}",
+})
+
+# Best June
+rows.append({
+    'Configuration': 'Best June 26',
+    'tau': f"{best_jun['tau']:.2f}", 'rho_floor': f"{best_jun['rho_floor']:.2f}",
+    'rho_hall': f"{best_jun['rho_hall']:.2f}",
+    'NMBE_jun': f"{best_jun['nmbe_jun']:+.1f}", 'CV_jun': f"{best_jun['cvrmse_jun']:.1f}",
+    'NMBE_nov': f"{best_jun['nmbe_nov']:+.1f}", 'CV_nov': f"{best_jun['cvrmse_nov']:.1f}",
+})
+
+# Best November
+rows.append({
+    'Configuration': 'Best November 20',
+    'tau': f"{best_nov['tau']:.2f}", 'rho_floor': f"{best_nov['rho_floor']:.2f}",
+    'rho_hall': f"{best_nov['rho_hall']:.2f}",
+    'NMBE_jun': f"{best_nov['nmbe_jun']:+.1f}", 'CV_jun': f"{best_nov['cvrmse_jun']:.1f}",
+    'NMBE_nov': f"{best_nov['nmbe_nov']:+.1f}", 'CV_nov': f"{best_nov['cvrmse_nov']:.1f}",
+})
+
+# Best Combined
+rows.append({
+    'Configuration': 'Best Combined',
+    'tau': f"{best_comb['tau']:.2f}", 'rho_floor': f"{best_comb['rho_floor']:.2f}",
+    'rho_hall': f"{best_comb['rho_hall']:.2f}",
+    'NMBE_jun': f"{best_comb['nmbe_jun']:+.1f}", 'CV_jun': f"{best_comb['cvrmse_jun']:.1f}",
+    'NMBE_nov': f"{best_comb['nmbe_nov']:+.1f}", 'CV_nov': f"{best_comb['cvrmse_nov']:.1f}",
+})
+
+print(pd.DataFrame(rows).to_markdown(index=False))
+```
+
+### Parameter Ranges from Per-Day Optima
+
+```{python}
+#| label: ranges-summary
+
+print("Recommended parameter ranges based on per-day optimization:")
+print()
+print(f"  tau:       [{min(best_jun['tau'], best_nov['tau']):.2f}, {max(best_jun['tau'], best_nov['tau']):.2f}]")
+print(f"  rho_floor: [{min(best_jun['rho_floor'], best_nov['rho_floor']):.2f}, {max(best_jun['rho_floor'], best_nov['rho_floor']):.2f}]")
+print(f"  rho_hall:  [{min(best_jun['rho_hall'], best_nov['rho_hall']):.2f}, {max(best_jun['rho_hall'], best_nov['rho_hall']):.2f}]")
+```
+
+---
+
+## Appendix: Running the Radiance Simulation
+
+To re-run a simulation with specific parameters:
+
+```bash
+cd edificio
+uv run python ../scripts/run_parametric_single.py --tau 0.76 --rho-floor 0.21 --rho-hall 0.29
+```
+
+To re-run the full calibrated validation simulation:
+
+```bash
+cd edificio
+bash ../scripts/run_simulation_validation_calibrated.sh
+```

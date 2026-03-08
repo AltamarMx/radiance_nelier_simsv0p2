@@ -1,0 +1,6 @@
+# Main scene file for annual daylighting simulation
+# Generated for Radiance Two-Phase Method
+
+# Include geometry files using xform
+!xform ./objects/scene.geom
+!xform ./objects/glazing.geom
